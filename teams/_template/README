@@ -1,0 +1,7 @@
+Usage Rules:
+- You must specify and configure an AWS provider. You should not supply any configuration around AWS credentials,
+  which will be handled by the build
+- You must not specify any alternative backend configuration for terraform
+- You must have a `config.tfvars` file that contains all the variables that need to be supplied; if all values
+  are hard-coded (not recommended), the file still must exist, but may be empty
+- The AWS provider should be configured to include the team name as part of the tags on all created resources (`Team=<team_name>`)

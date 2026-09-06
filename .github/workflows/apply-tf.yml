@@ -1,0 +1,118 @@
+name: Apply Terraform
+
+on:
+  push:
+    branches:
+      - 'teams/**'
+
+jobs:
+  config_verification:
+    runs-on: ubuntu-latest
+    outputs:
+      team_name: ${{steps.get-team-name.outputs.team_name}}
+      team_dir_exists: ${{steps.team-dir-exists.outputs.exists}}
+      destroy_marker_exists: ${{steps.destroy-marker-exists.outputs.exists}}
+    steps:
+        # checkout code
+      - uses: actions/checkout@v7
+
+        # parse team name from branch name
+      - id: get-team-name
+        run: |
+          team_name=$(echo "${{github.ref_name}}" | cut -d'/' -f2)
+          echo "team_name=$team_name" >> $GITHUB_OUTPUT
+
+        # check if an appropriate team directory exists
+      - id: team-dir-exists
+        uses: chrisreddington/validate-file-exists@v0.0.8
+        with:
+          required-files: "${{github.workspace}}/teams/${{steps.get-team-name.outputs.team_name}}"
+        continue-on-error: true
+
+        # check if an the team directory contains a marker file for destroy
+      - id: destroy-marker-exists
+        uses: chrisreddington/validate-file-exists@v0.0.8
+        with:
+          required-files: "${{github.workspace}}/teams/${{steps.get-team-name.outputs.team_name}}/DESTROY"
+        continue-on-error: true
+
+
+  apply:
+    needs: [ config_verification ]
+    runs-on: ubuntu-latest
+      # skip the whole thing if there is not a matching team directory
+    if: needs.config_verification.outputs.team_dir_exists == 'true' && needs.config_verification.outputs.destroy_marker_exists != 'true'
+    steps:
+        # checkout code
+      - uses: actions/checkout@v7
+
+        # setup terraform
+      - uses: hashicorp/setup-terraform@v4
+
+        # copy backend config into working directory
+      - name: Setup Backend Config
+        run: |
+          cp "${{github.workspace}}/common/backend.tf" "${{github.workspace}}/teams/${{needs.config_verification.outputs.team_name}}/"
+
+        # init terraform to the correct state file
+      - name: Terraform Init
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: terraform -chdir="${{github.workspace}}/teams/${{needs.config_verification.outputs.team_name}}" init -no-color -input=false -backend-config="key=${{needs.config_verification.outputs.team_name}}/${{needs.config_verification.outputs.team_name}}.tfstate"
+
+        # apply with auto-approve
+      - name: Terraform Apply
+        id: terraform-apply
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: terraform -chdir="${{github.workspace}}/teams/${{needs.config_verification.outputs.team_name}}" apply -no-color -input=false -auto-approve -var-file="${{github.workspace}}/teams/${{needs.config_verification.outputs.team_name}}/config.tfvars"
+
+        # put the terraform outputs on the job summary so users don't have to dig through the logs
+      - name: Publish Terraform Outputs to Job Summary
+        run: echo "${{ steps.terraform-apply.outputs.stdout }}" | sed -e "1,/Outputs:/ d" >> $GITHUB_STEP_SUMMARY
+
+  destroy:
+    needs: [ config_verification ]
+    runs-on: ubuntu-latest
+      # only run destroy if the marker file exists
+    if: needs.config_verification.outputs.team_dir_exists == 'true' && needs.config_verification.outputs.destroy_marker_exists == 'true'
+    steps:
+        # checkout code
+      - uses: actions/checkout@v7
+
+        # setup terraform
+      - uses: hashicorp/setup-terraform@v4
+
+        # copy backend config into working directory
+      - name: Setup Backend Config
+        run: |
+          cp "${{github.workspace}}/common/backend.tf" "${{github.workspace}}/teams/${{needs.config_verification.outputs.team_name}}/"
+
+        # init terraform to the correct state file
+      - name: Terraform Init
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: terraform -chdir="${{github.workspace}}/teams/${{needs.config_verification.outputs.team_name}}" init -no-color -input=false -backend-config="key=${{needs.config_verification.outputs.team_name}}/${{needs.config_verification.outputs.team_name}}.tfstate"
+
+        # apply with auto-approve
+      - name: Terraform Destroy
+        id: terraform-destroy
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: terraform -chdir="${{github.workspace}}/teams/${{needs.config_verification.outputs.team_name}}" destroy -no-color -input=false -auto-approve -var-file="${{github.workspace}}/teams/${{needs.config_verification.outputs.team_name}}/config.tfvars"
+
+        # setup aws cli
+      - uses: unfor19/install-aws-cli-action@v1
+
+        # delete the state file and git_hash from the s3 bucket to fully clean up everything
+      - name: Terraform State File Cleanup
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-2
+        run: |
+          aws s3 rm s3://bm-su-tf-store/${{needs.config_verification.outputs.team_name}}/${{needs.config_verification.outputs.team_name}}.tfstate
